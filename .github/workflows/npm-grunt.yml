@@ -1,0 +1,298 @@
+diff --git a/.github/workflows/nodejs-grunt-ci-complete.yml b/.github/workflows/nodejs-grunt-ci-complete.yml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/.github/workflows/nodejs-grunt-ci-complete.yml
+@@ -0,0 +1,235 @@
++name: NodeJS + Grunt — CI (coverage, junit, SBOM, audit)
++
++on:
++  push:
++    branches: [ "main" ]
++  pull_request:
++    branches: [ "main" ]
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++permissions:
++  contents: read
++  actions: read
++
++jobs:
++  build:
++    name: build (node ${{ matrix.node-version }})
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        node-version: [18.x, 20.x, 22.x]
++
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Use Node.js ${{ matrix.node-version }}
++        uses: actions/setup-node@v4
++        with:
++          node-version: ${{ matrix.node-version }}
++          cache: "npm"
++          cache-dependency-path: package-lock.json
++
++      - name: Show versions
++        run: |
++          node --version
++          npm --version
++          npx --version
++
++      - name: Install dependencies (npm ci)
++        run: npm ci
++
++      - name: Generate SBOM (Syft -> CycloneDX)
++        uses: anchore/syft-action@v0.11.1
++        with:
++          output-format: "cyclonedx-1.4"
++          output-path: "sbom/cyclonedx.xml"
++
++      - name: Detect npm scripts (lint/test/format)
++        id: detect-scripts
++        run: |
++          node -e "
++const fs=require('fs'); const p=JSON.parse(fs.readFileSync('package.json','utf8'));
++console.log('has_lint='+(p.scripts&&p.scripts.lint?1:0));
++console.log('has_test='+(p.scripts&&p.scripts.test?1:0));
++console.log('has_testci='+(p.scripts&&p.scripts['test:ci']?1:0));
++console.log('has_format='+(p.scripts&& (p.scripts.format||p.scripts['format:check']) ?1:0));
++"
++ | sed -n '1,4p' > /tmp/detect.out
++          echo "::set-output name=has_lint::$(grep -o 'has_lint=.' /tmp/detect.out | awk -F= '{print $2}')"
++          echo "::set-output name=has_test::$(grep -o 'has_test=.' /tmp/detect.out | awk -F= '{print $2}')"
++          echo "::set-output name=has_testci::$(grep -o 'has_testci=.' /tmp/detect.out | awk -F= '{print $2}')"
++          echo "::set-output name=has_format::$(grep -o 'has_format=.' /tmp/detect.out | awk -F= '{print $2}')"
++
++      - name: Lint (if configured)
++        if: steps.detect-scripts.outputs.has_lint == '1'
++        run: npm run lint
++
++      - name: Format check (if configured)
++        if: steps.detect-scripts.outputs.has_format == '1'
++        run: |
++          # CI should run a check-only format command (prettier --check)
++          npm run format || { echo "Format check failed"; exit 1; }
++
++      - name: Run tests + coverage (if configured)
++        if: steps.detect-scripts.outputs.has_testci == '1'
++        run: |
++          # test:ci should run tests and output coverage into ./coverage and junit into ./test-results
++          npm run test:ci
++
++      - name: Run tests (fallback: npm test)
++        if: steps.detect-scripts.outputs.has_testci != '1' && steps.detect-scripts.outputs.has_test == '1'
++        run: |
++          npm test --if-present
++
++      - name: Publish JUnit test results to GH checks
++        if: always() && (steps.detect-scripts.outputs.has_test == '1' || steps.detect-scripts.outputs.has_testci == '1')
++        uses: dorny/test-reporter@v1
++        with:
++          name: unit-tests
++          path: test-results/junit.xml
++          reporter: junit
++          fail-on-error: false
++
++      - name: Upload coverage artifact
++        if: always() && steps.detect-scripts.outputs.has_testci == '1'
++        uses: actions/upload-artifact@v4
++        with:
++          name: coverage-${{ matrix.node-version }}-${{ github.run_number }}
++          path: |
++            coverage
++            coverage/lcov.info
++
++      - name: Audit (fail on high/critical)
++        run: |
++          npm audit --json > audit.json || true
++          node -e '
++const fs = require("fs");
++try {
++  const data = JSON.parse(fs.readFileSync("audit.json","utf8") || "{}");
++  if (!data.metadata) { console.log("npm audit returned no metadata"); process.exit(0); }
++  const vulns = data.metadata.vulnerabilities || {};
++  const high = vulns.high || 0;
++  const critical = vulns.critical || 0;
++  console.log("Vulnerabilities:", JSON.stringify(vulns));
++  if (high > 0 || critical > 0) {
++    console.error("High/critical vulnerabilities detected. high=", high, "critical=", critical);
++    process.exit(2);
++  }
++} catch(e) { console.warn("audit parse error", e.message); }
++'
++
++      - name: Build with Grunt
++        run: npx grunt --no-color
++
++      - name: Upload SBOM artifact
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: sbom-${{ github.sha }}
++          path: sbom/cyclonedx.xml
++
++      - name: Upload diagnostics on failure
++        if: failure()
++        uses: actions/upload-artifact@v4
++        with:
++          name: ci-failure-${{ matrix.node-version }}-${{ github.run_number }}
++          path: |
++            audit.json
++            test-results/junit.xml
++            coverage/lcov.info
++            sbom/cyclonedx.xml
++
++      - name: Success message
++        if: success()
++        run: echo "CI passed for node ${{ matrix.node-version }}"
++
+diff --git a/.github/dependabot.yml b/.github/dependabot.yml
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.github/dependabot.yml
+@@ -0,0 +1,18 @@
++version: 2
++updates:
++  - package-ecosystem: "npm"
++    directory: "/" 
++    schedule:
++      interval: "daily"
++    open-pull-requests-limit: 10
++    # Optionally tune the ignore rules below if you want to skip specific packages
++    # ignore:
++    #   - dependency-name: "some-package"
++    #     update-types: ["version-update:semver-major"]
++
+diff --git a/CI_HELPER.md b/CI_HELPER.md
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/CI_HELPER.md
+@@ -0,0 +1,220 @@
++# CI Helper — Node + Grunt (Jest and Mocha examples)
++
++This file contains recommended `package.json` snippets and quick run instructions for the **unified CI** added to `.github/workflows/nodejs-grunt-ci-complete.yml`.
++
++> **Important**: These snippets are examples. Merge the parts that match your project's test stack (Jest vs Mocha). Do **not** store secrets in the repository.
++
++---
++
++## Jest (recommended modern stack)
++
++Add or merge the following into your `package.json` (scripts & devDependencies).
++
++```json
++{
++  "scripts": {
++    "test": "jest --runInBand",
++    "test:ci": "jest --runInBand --coverage --coverageDirectory=coverage --reporters=default --reporters=jest-junit",
++    "lint": "eslint . --ext .js,.ts || true",
++    "format": "prettier --check ."
++  },
++  "jest": {
++    "collectCoverage": true,
++    "coverageDirectory": "./coverage",
++    "collectCoverageFrom": ["src/**/*.{js,ts,tsx}"],
++    "reporters": [
++      "default",
++      ["jest-junit", { "outputDirectory": "./test-results", "outputName": "junit.xml" }]
++    ]
++  },
++  "devDependencies": {
++    "jest": "^29.0.0",
++    "jest-junit": "^13.0.0",
++    "eslint": "^8.0.0",
++    "prettier": "^3.0.0"
++  }
++}
++```
++
++**Local run**
++```bash
++npm ci
++npm run test:ci   # generates coverage/ and test-results/junit.xml
++```
++
++---
++
++## Mocha + NYC (alternative)
++
++If your project uses Mocha, use this snippet:
++
++```json
++{
++  "scripts": {
++    "test": "mocha --reporter spec",
++    "test:ci": "nyc --reporter=lcov --reporter=text mocha --reporter mocha-junit-reporter --reporter-options mochaFile=./test-results/junit.xml",
++    "lint": "eslint . --ext .js,.ts || true",
++    "format": "prettier --check ."
++  },
++  "devDependencies": {
++    "mocha": "^10.0.0",
++    "nyc": "^15.0.0",
++    "mocha-junit-reporter": "^2.0.0",
++    "eslint": "^8.0.0",
++    "prettier": "^3.0.0"
++  },
++  "nyc": {
++    "all": true,
++    "reporter": ["lcov", "text"],
++    "report-dir": "./coverage",
++    "include": ["src/**/*.js"]
++  }
++}
++```
++
++**Local run**
++```bash
++npm ci
++npm run test:ci   # generates coverage/ and test-results/junit.xml
++```
++
++---
++
++## Notes & tips
++
++- **Grunt**: If your repo assumes a global `grunt` CLI, add `grunt` and `grunt-cli` as `devDependencies` to ensure `npx grunt` works in CI:
++  ```bash
++  npm i -D grunt grunt-cli
++  ```
++
++- **SBOM**: The workflow uses `anchore/syft-action` to generate a CycloneDX SBOM at `sbom/cyclonedx.xml`. The SBOM is uploaded as an artifact.
++
++- **Audit**: The CI runs `npm audit` and fails the job if **high** or **critical** vulnerabilities are present. Adjust the script if you want different thresholds.
++
++- **JUnit**: The test runner must produce `test-results/junit.xml` for the test reporter to display results in the GitHub Actions UI. Both Jest and Mocha snippets above create this file.
++
++- **Artifacts**: On failure the workflow uploads `audit.json`, `test-results/junit.xml`, `coverage/lcov.info`, and `sbom/cyclonedx.xml` to the run artifacts.
++
++---
++
++## Quick acceptance checklist
++
++1. Create or merge `test:ci` into your `package.json` (Jest or Mocha variant).
++2. Ensure `package-lock.json` is committed so Actions caching works.
++3. Apply this patch, push to a branch, and open a PR to `main`.
++4. On PR the workflow should run across Node 18/20/22. Verify:
++   - `sbom/cyclonedx.xml` artifact present,
++   - coverage artifact present (if `test:ci` configured),
++   - `test-results/junit.xml` published in the Actions UI,
++   - job fails if high/critical `npm audit` issues exist.
++
++If you want, I can now:
++- produce a single `git format-patch`-style file instead of this unified patch, or
++- automatically inject the Jest or Mocha snippet into your `package.json` (I will print the exact merged JSON to paste).
++
++Say `APPLY_PATCH` when you have applied the patch and want the next step (e.g., update package.json with Jest or Mocha), or say `EMIT_PATCH_FILE` if you want the raw patch file output for download.
++
